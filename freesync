@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+#
+# freesync — friendly two-way folder sync for photo editing.
+#
+# Remembers folder pairs ("profiles") so you never retype paths.
+# Always previews what will happen before touching anything.
+# Never deletes: it only ever adds/updates files.
+#
+# Usage: freesync            (interactive menu)
+#        freesync --help
+#
+set -eo pipefail
+
+VERSION="1.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/freesync"
+PROFILES_FILE="$CONFIG_DIR/profiles.tsv"
+EXCLUDES_FILE="$CONFIG_DIR/excludes.txt"
+EXTRA_FILE="$CONFIG_DIR/rsync-extra.txt"
+LAST_FILE="$CONFIG_DIR/last"
+
+# ---------------------------------------------------------------- output ----
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+  B="$(tput bold)"; DIM="$(tput dim)"; R="$(tput sgr0)"
+  RED="$(tput setaf 1)"; GRN="$(tput setaf 2)"; YEL="$(tput setaf 3)"; BLU="$(tput setaf 4)"
+else
+  B=""; DIM=""; R=""; RED=""; GRN=""; YEL=""; BLU=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "${BLU}$*${R}"; }
+ok()   { printf '%s\n' "${GRN}$*${R}"; }
+warn() { printf '%s\n' "${YEL}warning:${R} $*" >&2; }
+die()  { printf '%s\n' "${RED}error:${R} $*" >&2; exit 1; }
+
+hbytes() {
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B KB MB GB TB PB", u, " "); i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s\n", b, u[i]; else printf "%.1f %s\n", b, u[i]
+  }'
+}
+
+# ----------------------------------------------------------------- rsync ----
+
+find_rsync() {
+  for c in /opt/homebrew/bin/rsync /usr/local/bin/rsync; do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return; }
+  done
+  command -v rsync >/dev/null 2>&1 || die "rsync not found. Install it with: brew install rsync"
+  command -v rsync
+}
+RSYNC="$(find_rsync)"
+
+# ------------------------------------------------------------------ setup ----
+
+ensure_config() {
+  [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR"
+  [ -f "$PROFILES_FILE" ] || : > "$PROFILES_FILE"
+
+  if [ ! -f "$EXCLUDES_FILE" ]; then
+    cat > "$EXCLUDES_FILE" <<'EOF'
+# Files freesync never copies. One rsync pattern per line.
+# Edit freely:  freesync edit-excludes
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.TemporaryItems
+.fseventsd
+.DocumentRevisions-V100
+Thumbs.db
+desktop.ini
+*.lrcat-journal
+*.lrcat.lock
+EOF
+  fi
+
+  if [ ! -f "$EXTRA_FILE" ]; then
+    cat > "$EXTRA_FILE" <<'EOF'
+# Extra rsync options, one per line. Lines starting with # are ignored.
+# Edit with:  freesync edit-options
+#
+# If the server complains about permissions or ownership (common on WebDAV
+# and SMB shares), uncomment these three lines:
+#--no-perms
+#--no-owner
+#--no-group
+EOF
+  fi
+}
+
+# ----------------------------------------------------------------- paths ----
+
+# Expand a leading ~ and strip trailing slashes.
+normalize_path() {
+  local p="$1"
+  case "$p" in
+    "~")   p="$HOME" ;;
+    "~/"*) p="$HOME/${p#"~/"}" ;;
+  esac
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  printf '%s\n' "$p"
+}
+
+# If the path lives on an external volume, make sure that volume is mounted.
+# Without this check a push could silently write into an empty local folder
+# where the server used to be.
+check_volume() {
+  local path="$1" role="$2" vol rest
+  case "$path" in
+    /Volumes/*) ;;
+    *) return 0 ;;
+  esac
+  rest="${path#/Volumes/}"
+  vol="/Volumes/${rest%%/*}"
+  if ! mount | grep -q " on $vol "; then
+    die "the $role volume is not mounted: $vol
+       Connect to the server (Finder → Go → Connect to Server) and try again."
+  fi
+}
+
+check_not_nested() {
+  local a="$1" b="$2"
+  case "$a/" in "$b"/*) die "these two folders are inside each other:
+       $a
+       $b" ;; esac
+  case "$b/" in "$a"/*) die "these two folders are inside each other:
+       $a
+       $b" ;; esac
+}
+
+# -------------------------------------------------------------- profiles ----
+
+# Parallel arrays (bash 3.2 has no associative arrays).
+PN=(); PL=(); PR=(); PM=()
+
+load_profiles() {
+  PN=(); PL=(); PR=(); PM=()
+  local name local_p remote_p mode
+  while IFS=$'\t' read -r name local_p remote_p mode; do
+    case "$name" in ''|'#'*) continue ;; esac
+    [ -n "$local_p" ] && [ -n "$remote_p" ] || continue
+    PN[${#PN[@]}]="$name"
+    PL[${#PL[@]}]="$local_p"
+    PR[${#PR[@]}]="$remote_p"
+    PM[${#PM[@]}]="${mode:-new}"
+  done < "$PROFILES_FILE"
+}
+
+save_profiles() {
+  local tmp="$PROFILES_FILE.tmp.$$" i=0
+  {
+    printf '# freesync profiles: name<TAB>local<TAB>remote<TAB>mode\n'
+    printf '# mode "new"     = copy only files the other side does not have (default)\n'
+    printf '# mode "changed" = also overwrite older files with newer ones\n'
+    while [ "$i" -lt "${#PN[@]}" ]; do
+      printf '%s\t%s\t%s\t%s\n' "${PN[$i]}" "${PL[$i]}" "${PR[$i]}" "${PM[$i]}"
+      i=$((i + 1))
+    done
+  } > "$tmp"
+  mv "$tmp" "$PROFILES_FILE"
+}
+
+# Sets P_IDX/P_NAME/P_LOCAL/P_REMOTE/P_MODE, or returns 1.
+select_profile() {
+  local want="$1" i=0
+  while [ "$i" -lt "${#PN[@]}" ]; do
+    if [ "${PN[$i]}" = "$want" ]; then
+      P_IDX="$i"; P_NAME="${PN[$i]}"; P_LOCAL="${PL[$i]}"; P_REMOTE="${PR[$i]}"; P_MODE="${PM[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+remember_last() { printf '%s\n' "$1" > "$LAST_FILE"; }
+read_last()     { [ -f "$LAST_FILE" ] && head -n 1 "$LAST_FILE"; }
+
+cmd_list() {
+  load_profiles
+  if [ "${#PN[@]}" -eq 0 ]; then
+    say "No folder pairs saved yet. Add one with:  ${B}freesync add${R}"
+    return
+  fi
+  local last i=0
+  last="$(read_last || true)"
+  say "${B}Saved folder pairs${R}  ${DIM}($PROFILES_FILE)${R}"
+  while [ "$i" -lt "${#PN[@]}" ]; do
+    local tag=""
+    [ "${PN[$i]}" = "$last" ] && tag="  ${GRN}← last used${R}"
+    say ""
+    say "  ${B}${PN[$i]}${R}$tag"
+    say "    local  ${PL[$i]}"
+    say "    server ${PR[$i]}"
+    say "    mode   ${PM[$i]}"
+    i=$((i + 1))
+  done
+  say ""
+}
+
+cmd_add() {
+  load_profiles
+  local name="$1" lp="$2" rp="$3" mode="${4:-new}"
+
+  if [ -z "$name" ]; then
+    say "${B}Add a folder pair${R}"
+    say "${DIM}Tip: drag a folder from Finder into this window to paste its path.${R}"
+    say ""
+    printf 'Short name (e.g. trip-day2): '; IFS= read -r name < /dev/tty
+    printf 'Folder on YOUR computer: ';        IFS= read -r lp < /dev/tty
+    printf 'Folder on the SERVER: ';           IFS= read -r rp < /dev/tty
+  fi
+
+  # Finder drag-and-drop escapes spaces; undo that, and drop stray quotes.
+  lp="$(printf '%s' "$lp" | sed 's/\\ / /g; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')"
+  rp="$(printf '%s' "$rp" | sed 's/\\ / /g; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')"
+
+  [ -n "$name" ] || die "a name is required"
+  [ -n "$lp" ] && [ -n "$rp" ] || die "both folders are required"
+  case "$name" in *[!A-Za-z0-9._-]*) die "name may only contain letters, numbers, . _ -" ;; esac
+
+  lp="$(normalize_path "$lp")"
+  rp="$(normalize_path "$rp")"
+  case "$lp" in /*) ;; *) die "local folder must be a full path starting with /" ;; esac
+  case "$rp" in /*) ;; *) die "server folder must be a full path starting with /" ;; esac
+  check_not_nested "$lp" "$rp"
+
+  [ -d "$lp" ] || warn "local folder does not exist yet: $lp"
+  [ -d "$rp" ] || warn "server folder does not exist yet (is the server mounted?): $rp"
+
+  if select_profile "$name"; then
+    PL[$P_IDX]="$lp"; PR[$P_IDX]="$rp"; PM[$P_IDX]="$mode"
+    save_profiles
+    ok "Updated \"$name\"."
+  else
+    PN[${#PN[@]}]="$name"; PL[${#PL[@]}]="$lp"; PR[${#PR[@]}]="$rp"; PM[${#PM[@]}]="$mode"
+    save_profiles
+    ok "Saved \"$name\"."
+  fi
+  remember_last "$name"
+  say ""
+  say "Now just run:  ${B}freesync pull $name${R}   or   ${B}freesync push $name${R}"
+  say "Or run ${B}freesync${R} with no arguments and pick it from the menu."
+}
+
+cmd_remove() {
+  local want="$1"
+  [ -n "$want" ] || die "usage: freesync remove NAME"
+  load_profiles
+  select_profile "$want" || die "no folder pair named \"$want\" (see: freesync list)"
+  local nn=() nl=() nr=() nm=() i=0
+  while [ "$i" -lt "${#PN[@]}" ]; do
+    if [ "$i" -ne "$P_IDX" ]; then
+      nn[${#nn[@]}]="${PN[$i]}"; nl[${#nl[@]}]="${PL[$i]}"
+      nr[${#nr[@]}]="${PR[$i]}"; nm[${#nm[@]}]="${PM[$i]}"
+    fi
+    i=$((i + 1))
+  done
+  PN=("${nn[@]+"${nn[@]}"}"); PL=("${nl[@]+"${nl[@]}"}")
+  PR=("${nr[@]+"${nr[@]}"}"); PM=("${nm[@]+"${nm[@]}"}")
+  save_profiles
+  ok "Removed \"$want\". (No files were touched.)"
+}
+
+cmd_mode() {
+  local want="$1" mode="$2"
+  [ -n "$want" ] && [ -n "$mode" ] || die "usage: freesync mode NAME new|changed"
+  case "$mode" in new|changed) ;; *) die "mode must be \"new\" or \"changed\"" ;; esac
+  load_profiles
+  select_profile "$want" || die "no folder pair named \"$want\""
+  PM[$P_IDX]="$mode"
+  save_profiles
+  ok "\"$want\" is now in ${B}$mode${R} mode."
+}
+
+# ------------------------------------------------------------ the syncing ----
+
+# Options shared by the preview and the real run.
+# Deliberately no --delete: freesync never removes anything.
+build_opts() {
+  # No --human-readable here: the preview parses these numbers, and -h would
+  # turn them into "12.58M". It is added back for the runs the user reads.
+  OPTS=(--archive --itemize-changes --stats --partial --modify-window=1
+        --exclude-from="$EXCLUDES_FILE")
+  [ "$1" = "new" ] && OPTS[${#OPTS[@]}]="--ignore-existing"
+  OPTS[${#OPTS[@]}]="--update"
+  local line
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    OPTS[${#OPTS[@]}]="$line"
+  done < "$EXTRA_FILE"
+}
+
+confirm() {
+  local prompt="$1" ans
+  printf '%s' "$prompt"
+  IFS= read -r ans < /dev/tty || return 1
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0 ;; esac
+  return 1
+}
+
+# transfer <pull|push>
+transfer() {
+  local dir="$1" src dst src_label dst_label
+
+  if [ "$dir" = "pull" ]; then
+    src="$P_REMOTE"; dst="$P_LOCAL"; src_label="server"; dst_label="your computer"
+  else
+    src="$P_LOCAL"; dst="$P_REMOTE"; src_label="your computer"; dst_label="server"
+  fi
+
+  check_volume "$src" "$src_label"
+  check_volume "$dst" "$dst_label"
+  [ -d "$src" ] || die "the $src_label folder does not exist: $src"
+
+  if [ ! -d "$dst" ]; then
+    warn "the $dst_label folder does not exist: $dst"
+    if [ "$ASSUME_YES" = 1 ] || confirm "Create it? [y/N] "; then
+      mkdir -p "$dst" || die "could not create $dst"
+    else
+      die "nothing done"
+    fi
+  fi
+
+  say ""
+  say "${B}$dir${R}  ${DIM}[$P_NAME, mode: $P_MODE]${R}"
+  say "  from  $src"
+  say "  to    $dst"
+
+  build_opts "$P_MODE"
+
+  # Trailing slash on the source: copy the *contents* of src into dst, so both
+  # folders end up mirroring each other rather than nesting a subfolder.
+  local from="$src/"
+
+  if [ "$ASSUME_YES" != 1 ]; then
+    local preview rc=0
+    preview="$(mktemp -t freesync)"
+    say ""
+    info "Checking what would change (nothing is copied yet)…"
+    "$RSYNC" "${OPTS[@]}" --no-human-readable --dry-run "$from" "$dst" > "$preview" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 24 ]; then
+      say ""
+      sed -n '1,40p' "$preview" >&2
+      rm -f "$preview"
+      die "rsync failed while previewing (exit $rc)"
+    fi
+
+    local files bytes
+    files="$(tr -d ',' < "$preview" | awk '/Number of regular files transferred:/ {print $NF; exit}')"
+    bytes="$(tr -d ',' < "$preview" | awk '/Total transferred file size:/ {print $(NF-1); exit}')"
+    files="${files:-0}"; bytes="${bytes:-0}"
+
+    if [ "$files" -eq 0 ]; then
+      rm -f "$preview"
+      ok "Already up to date — nothing to $dir."
+      return 0
+    fi
+
+    say ""
+    say "${B}Would copy $files file(s), $(hbytes "$bytes"):${R}"
+    { grep -E '^[<>]f' "$preview" || true; } | sed 's/^[^ ]* /  /' | head -n 20
+    [ "$files" -gt 20 ] && say "  ${DIM}… and $((files - 20)) more${R}"
+    rm -f "$preview"
+
+    if [ "$DRY_ONLY" = 1 ]; then
+      say ""
+      info "Preview only (-n). Nothing was copied."
+      return 0
+    fi
+
+    say ""
+    confirm "${B}Copy these to the $dst_label? [y/N] ${R}" || { say "Skipped."; return 0; }
+  elif [ "$DRY_ONLY" = 1 ]; then
+    "$RSYNC" "${OPTS[@]}" --human-readable --dry-run "$from" "$dst"
+    return 0
+  fi
+
+  say ""
+  local rc=0
+  "$RSYNC" "${OPTS[@]}" --human-readable --info=progress2 "$from" "$dst" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "Done — $dir finished."
+  elif [ "$rc" -eq 24 ]; then
+    ok "Done — $dir finished. (Some files vanished while copying; that is usually harmless.)"
+  else
+    die "rsync stopped with exit code $rc. Nothing was deleted; you can safely run it again."
+  fi
+}
+
+# ------------------------------------------------------------------- menu ----
+
+pick_profile_interactively() {
+  load_profiles
+  if [ "${#PN[@]}" -eq 0 ]; then
+    say "${B}Welcome to freesync${R} — let's set up your first folder pair."
+    say ""
+    cmd_add
+    exit 0
+  fi
+
+  local last default_idx=1 i=0
+  last="$(read_last || true)"
+  say "${B}freesync${R} ${DIM}v$VERSION${R}"
+  say ""
+  while [ "$i" -lt "${#PN[@]}" ]; do
+    local tag=""
+    if [ "${PN[$i]}" = "$last" ]; then tag="  ${GRN}(last used)${R}"; default_idx=$((i + 1)); fi
+    say "  $((i + 1))) ${B}${PN[$i]}${R}$tag"
+    i=$((i + 1))
+  done
+  say ""
+  say "  a) add a new folder pair     l) show details     q) quit"
+  say ""
+  local choice
+  printf 'Which folder? [%s] ' "$default_idx"
+  IFS= read -r choice < /dev/tty || exit 0
+  [ -n "$choice" ] || choice="$default_idx"
+
+  case "$choice" in
+    a|A) say ""; cmd_add; exit 0 ;;
+    l|L) say ""; cmd_list; exit 0 ;;
+    q|Q) exit 0 ;;
+    *[!0-9]*|'') die "\"$choice\" is not one of the options" ;;
+  esac
+  [ "$choice" -ge 1 ] && [ "$choice" -le "${#PN[@]}" ] || die "no option $choice"
+
+  local idx=$((choice - 1))
+  select_profile "${PN[$idx]}" || die "internal error selecting profile"
+}
+
+pick_action_interactively() {
+  say ""
+  say "  1) ${B}Pull${R}   server → your computer   ${DIM}(get photos to work on)${R}"
+  say "  2) ${B}Push${R}   your computer → server   ${DIM}(send your edits back)${R}"
+  say "  3) ${B}Both${R}   pull, then push"
+  say ""
+  local a
+  printf 'What would you like to do? [1] '
+  IFS= read -r a < /dev/tty || exit 0
+  [ -n "$a" ] || a=1
+  case "$a" in
+    1) ACTION="pull" ;;
+    2) ACTION="push" ;;
+    3) ACTION="both" ;;
+    q|Q) exit 0 ;;
+    *) die "\"$a\" is not one of the options" ;;
+  esac
+}
+
+# ------------------------------------------------------------------- help ----
+
+usage() {
+  cat <<EOF
+${B}freesync${R} v$VERSION — friendly two-way folder sync for photo editing
+
+${B}EVERYDAY USE${R}
+  freesync                    pick a folder and an action from a menu
+  freesync pull [NAME]        server → your computer
+  freesync push [NAME]        your computer → server
+  freesync both [NAME]        pull, then push
+                              NAME defaults to the folder you used last
+
+${B}MANAGING FOLDER PAIRS${R}
+  freesync add                add a pair, asking you for the paths
+  freesync add NAME LOCAL SERVER
+  freesync list               show saved pairs
+  freesync remove NAME        forget a pair (never touches files)
+  freesync mode NAME new|changed
+
+${B}OPTIONS${R}
+  -n, --dry-run   preview only, never copy
+  -y, --yes       skip the preview and the confirmation
+  -h, --help      this text
+  -V, --version   print version
+
+${B}MODES${R}
+  new       (default) copy only files the other side does not have.
+            Nothing existing is ever overwritten. Safest.
+  changed   also overwrite a file when the other side has a newer version.
+            Use this if you want edits made in place (sidecars, .xmp,
+            re-saved JPEGs) to travel back to the server.
+
+${B}NOTES${R}
+  • freesync never deletes anything, in either direction.
+  • It always previews first and waits for you to confirm.
+  • If the server folder lives on a mounted volume that is not connected,
+    freesync stops instead of writing to your local disk by mistake.
+
+${B}FILES${R}
+  $PROFILES_FILE
+  $EXCLUDES_FILE      files never copied  (freesync edit-excludes)
+  $EXTRA_FILE   extra rsync options (freesync edit-options)
+EOF
+}
+
+open_editor() {
+  local f="$1"
+  if [ -n "$EDITOR" ]; then "$EDITOR" "$f"
+  elif command -v nano >/dev/null 2>&1; then nano "$f"
+  else open -t "$f"
+  fi
+}
+
+# ------------------------------------------------------------------- main ----
+
+ensure_config
+
+ACTION=""; PROFILE=""; DRY_ONLY=0; ASSUME_YES=0
+ARGS=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_ONLY=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -V|--version) say "freesync $VERSION"; exit 0 ;;
+    --)           shift; while [ "$#" -gt 0 ]; do ARGS[${#ARGS[@]}]="$1"; shift; done; break ;;
+    -*)           die "unknown option: $1  (try: freesync --help)" ;;
+    *)            ARGS[${#ARGS[@]}]="$1" ;;
+  esac
+  shift
+done
+
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+case "${1:-}" in
+  ""|menu)               ACTION="" ;;
+  pull|push|both|sync)   ACTION="$1"; [ "$ACTION" = "sync" ] && ACTION="both"; PROFILE="${2:-}" ;;
+  add|new)               shift; cmd_add "${1:-}" "${2:-}" "${3:-}" "${4:-}"; exit 0 ;;
+  list|ls)               cmd_list; exit 0 ;;
+  remove|rm|forget)      cmd_remove "${2:-}"; exit 0 ;;
+  mode)                  cmd_mode "${2:-}" "${3:-}"; exit 0 ;;
+  edit-excludes)         open_editor "$EXCLUDES_FILE"; exit 0 ;;
+  edit-options)          open_editor "$EXTRA_FILE"; exit 0 ;;
+  edit)                  open_editor "$PROFILES_FILE"; exit 0 ;;
+  help)                  usage; exit 0 ;;
+  *)                     die "unknown command: $1  (try: freesync --help)" ;;
+esac
+
+if [ -n "$PROFILE" ]; then
+  load_profiles
+  select_profile "$PROFILE" || die "no folder pair named \"$PROFILE\" (see: freesync list)"
+elif [ -n "$ACTION" ]; then
+  load_profiles
+  last="$(read_last || true)"
+  [ -n "$last" ] || die "no folder pair remembered yet. Run: freesync add"
+  select_profile "$last" || die "the last used pair \"$last\" is gone. Run: freesync list"
+  say "${DIM}Using last folder pair: $P_NAME${R}"
+else
+  pick_profile_interactively
+fi
+
+[ -n "$ACTION" ] || pick_action_interactively
+
+check_not_nested "$P_LOCAL" "$P_REMOTE"
+remember_last "$P_NAME"
+
+case "$ACTION" in
+  pull) transfer pull ;;
+  push) transfer push ;;
+  both) transfer pull; transfer push ;;
+esac

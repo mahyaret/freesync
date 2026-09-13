@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+._*
+
+# Local editor / agent settings (may contain personal paths)
+.claude/
+.vscode/
+.idea/
