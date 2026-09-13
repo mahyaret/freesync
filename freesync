@@ -92,6 +92,69 @@ EOF
 
 # ----------------------------------------------------------------- paths ----
 
+# Strip carriage returns and surrounding blanks. A CR sneaks in whenever
+# profiles.tsv is edited on Windows, pasted through a chat window, or copied
+# between machines -- and a path ending in CR prints identically to a good one
+# while failing every single stat() call. Folder names really ending in a
+# space or tab are not supported, on purpose.
+trim() {
+  local s="$1"
+  s="${s//$'\r'/}"
+  while :; do case "$s" in ' '*|$'\t'*) s="${s#?}" ;; *) break ;; esac; done
+  while :; do case "$s" in *' '|*$'\t') s="${s%?}" ;; *) break ;; esac; done
+  printf '%s' "$s"
+}
+
+# Explain *why* a path is unusable, because "it does not exist" is useless when
+# you can cd into it by hand. Walks the path and reports the first component
+# that is really missing, then shows what is actually there.
+diagnose_path() {
+  local path="$1" walk="" parent="/" comp rest near
+  say "  freesync looked for exactly this:"
+  say "    [$path]"
+
+  if [ "$path" != "$(trim "$path")" ]; then
+    say "  ${YEL}!${R} This path has invisible leading/trailing whitespace or a"
+    say "    carriage return. That alone makes it unusable, and it looks normal"
+    say "    on screen. Re-add the pair to fix it."
+  fi
+
+  rest="${path#/}"
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    case "$rest" in *"/"*) rest="${rest#*/}" ;; *) rest="" ;; esac
+    walk="$walk/$comp"
+    if [ ! -e "$walk" ]; then
+      say ""
+      say "  ${RED}✗${R} This part is what is missing:"
+      say "    $walk"
+      say ""
+      say "  $parent really contains:"
+      ls -1 "$parent" 2>/dev/null | head -n 20 | sed 's/^/      /' || say "      (cannot list it)"
+      near="$(ls -1 "$parent" 2>/dev/null | grep -ixF -- "$comp" | head -n 3 || true)"
+      if [ -n "$near" ]; then
+        say ""
+        say "  ${YEL}!${R} Same name, different capitalisation, exists: $near"
+        say "    Your Mac's own disk ignores case but the server does not."
+      fi
+      case "$path" in
+        *[!\ -~]*)
+          say ""
+          say "  ${YEL}!${R} This path contains non-English characters. macOS and WebDAV"
+          say "    store accents differently (NFC vs NFD), so two names that look"
+          say "    identical are not equal. Copy the name from the list above"
+          say "    rather than typing it." ;;
+      esac
+      return 1
+    fi
+    parent="$walk"
+  done
+
+  say "  ${GRN}✓${R} Every part of that path exists."
+  [ -d "$path" ] || say "  ${RED}✗${R} ...but it is a file, not a folder."
+  return 0
+}
+
 # Expand a leading ~ and strip trailing slashes.
 normalize_path() {
   local p="$1"
@@ -139,7 +202,9 @@ load_profiles() {
   PN=(); PL=(); PR=(); PM=()
   local name local_p remote_p mode
   while IFS=$'\t' read -r name local_p remote_p mode; do
+    name="$(trim "$name")"
     case "$name" in ''|'#'*) continue ;; esac
+    local_p="$(trim "$local_p")"; remote_p="$(trim "$remote_p")"; mode="$(trim "$mode")"
     [ -n "$local_p" ] && [ -n "$remote_p" ] || continue
     PN[${#PN[@]}]="$name"
     PL[${#PL[@]}]="$local_p"
@@ -216,6 +281,7 @@ cmd_add() {
   # Finder drag-and-drop escapes spaces; undo that, and drop stray quotes.
   lp="$(printf '%s' "$lp" | sed 's/\\ / /g; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')"
   rp="$(printf '%s' "$rp" | sed 's/\\ / /g; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')"
+  name="$(trim "$name")"; lp="$(trim "$lp")"; rp="$(trim "$rp")"
 
   [ -n "$name" ] || die "a name is required"
   [ -n "$lp" ] && [ -n "$rp" ] || die "both folders are required"
@@ -275,6 +341,55 @@ cmd_mode() {
   ok "\"$want\" is now in ${B}$mode${R} mode."
 }
 
+# Everything needed to diagnose "it says the folder does not exist but I can
+# cd into it", from a machine that is not in front of you.
+cmd_doctor() {
+  local want="$1" i=0
+  load_profiles
+  say "${B}freesync doctor${R}  ${DIM}v$VERSION${R}"
+  say ""
+  say "rsync    $RSYNC"
+  say "         $("$RSYNC" --version 2>/dev/null | head -n 1)"
+  say "bash     $BASH_VERSION"
+  say "config   $CONFIG_DIR"
+  say ""
+
+  if [ ! -s "$PROFILES_FILE" ]; then
+    say "No profiles saved. Add one with: freesync add"
+    return 0
+  fi
+
+  # CRLF in the config is invisible everywhere else, so name it explicitly.
+  if LC_ALL=C grep -q $'\r' "$PROFILES_FILE"; then
+    say "${YEL}!${R} profiles.tsv contains carriage returns (CRLF line endings)."
+    say "  freesync now strips them automatically, but the file was probably"
+    say "  edited on Windows or copied through something that rewrote it."
+    say ""
+  fi
+  if LC_ALL=C grep -qE $'^[^#\t]+ +\t|\t +' "$PROFILES_FILE"; then
+    say "${YEL}!${R} profiles.tsv has blanks around a tab separator (now trimmed)."
+    say ""
+  fi
+
+  say "${B}Mounted volumes${R}"
+  mount | grep -E ' on /Volumes/' | sed 's/^/  /' || say "  (none)"
+  say ""
+
+  while [ "$i" -lt "${#PN[@]}" ]; do
+    if [ -z "$want" ] || [ "$want" = "${PN[$i]}" ]; then
+      say "${B}Profile: ${PN[$i]}${R}  ${DIM}(mode ${PM[$i]})${R}"
+      say ""
+      say "  ${B}local${R}"
+      diagnose_path "${PL[$i]}" || true
+      say ""
+      say "  ${B}server${R}"
+      diagnose_path "${PR[$i]}" || true
+      say ""
+    fi
+    i=$((i + 1))
+  done
+}
+
 # ------------------------------------------------------------ the syncing ----
 
 # Options shared by the preview and the real run.
@@ -313,10 +428,19 @@ transfer() {
 
   check_volume "$src" "$src_label"
   check_volume "$dst" "$dst_label"
-  [ -d "$src" ] || die "the $src_label folder does not exist: $src"
+  if [ ! -d "$src" ]; then
+    printf '%s\n' "${RED}error:${R} the $src_label folder is not usable." >&2
+    diagnose_path "$src" >&2 || true
+    say "" >&2
+    say "  Re-add the pair once the real path is known:" >&2
+    say "    freesync add $P_NAME <local-folder> <server-folder>" >&2
+    exit 1
+  fi
 
   if [ ! -d "$dst" ]; then
     warn "the $dst_label folder does not exist: $dst"
+    diagnose_path "$dst" || true
+    say ""
     if [ "$ASSUME_YES" = 1 ] || confirm "Create it? [y/N] "; then
       mkdir -p "$dst" || die "could not create $dst"
     else
@@ -469,6 +593,7 @@ ${B}MANAGING FOLDER PAIRS${R}
   freesync list               show saved pairs
   freesync remove NAME        forget a pair (never touches files)
   freesync mode NAME new|changed
+  freesync doctor [NAME]      diagnose paths that "should" work
 
 ${B}OPTIONS${R}
   -n, --dry-run   preview only, never copy
@@ -533,6 +658,7 @@ case "${1:-}" in
   list|ls)               cmd_list; exit 0 ;;
   remove|rm|forget)      cmd_remove "${2:-}"; exit 0 ;;
   mode)                  cmd_mode "${2:-}" "${3:-}"; exit 0 ;;
+  doctor|check)          cmd_doctor "${2:-}"; exit 0 ;;
   edit-excludes)         open_editor "$EXCLUDES_FILE"; exit 0 ;;
   edit-options)          open_editor "$EXTRA_FILE"; exit 0 ;;
   edit)                  open_editor "$PROFILES_FILE"; exit 0 ;;

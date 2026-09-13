@@ -186,6 +186,25 @@ Plain text — safe to edit, copy to another Mac, or back up.
 macOS with `rsync` from Homebrew (`brew install rsync`). Works with the stock
 `/bin/bash` 3.2, so there's nothing else to install.
 
+## Troubleshooting
+
+**"the server folder is not usable" — but I can `cd` into it**
+
+Run `freesync doctor`. It walks the path, shows the first component that is
+really missing, and lists what that folder actually contains. The usual causes
+all look identical on screen:
+
+| Cause | Why `cd` still works |
+| --- | --- |
+| A carriage return or trailing space in the saved path | You typed/tab-completed the real name; the config holds `…/raw\r`, which prints as `…/raw`. freesync strips these automatically now. |
+| Capitalisation | Your Mac's disk ignores case, most servers don't, so `Day2` and `day2` are one folder locally and two on the server. |
+| Accented or non-Latin names | macOS stores `í` decomposed (NFD), servers usually send it precomposed (NFC). Identical on screen, not equal to `test`. Copy the name out of `ls` instead of typing it. |
+| A different mount name on that machine | macOS appends `-1` when a stale mount exists, so the share lands at `/Volumes/photos-1`. `freesync doctor` lists every mounted volume. |
+| A wrong component deeper in the path | `Q3` vs `Q4`, `Day2` vs `Day 2`. The doctor points at the exact part. |
+
+Profiles are per-machine. Copying `profiles.tsv` between computers is what
+produces most of the above — `freesync add` on each machine is safer.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
