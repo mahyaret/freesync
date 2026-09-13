@@ -183,8 +183,45 @@ Plain text — safe to edit, copy to another Mac, or back up.
 
 ## Requirements
 
-macOS with `rsync` from Homebrew (`brew install rsync`). Works with the stock
-`/bin/bash` 3.2, so there's nothing else to install.
+- **rsync 3.1.0 or newer** — install it with `brew install rsync`.
+- macOS. Works with the stock `/bin/bash` 3.2, so nothing else to install.
+
+### The rsync that ships with macOS is not enough
+
+`/usr/bin/rsync` on macOS is **openrsync**, which identifies itself as
+"rsync version 2.6.9 compatible". It rejects two options freesync relies on
+(`--info=progress2` and `--no-human-readable`), so freesync will stop with an
+`unrecognized option` error instead of syncing. Older macOS shipped the real
+rsync 2.6.9 from 2006, which behaves the same way.
+
+Check which one you have:
+
+```bash
+rsync --version | head -1
+```
+
+| Output | Verdict |
+| --- | --- |
+| `rsync  version 3.5.0  protocol version 32` | good |
+| `openrsync: protocol version 29` | too old — `brew install rsync` |
+| `rsync  version 2.6.9  protocol version 29` | too old — `brew install rsync` |
+
+`freesync doctor` prints the same thing along with the exact binary in use.
+
+freesync picks the first rsync it finds, in this order:
+
+1. `/opt/homebrew/bin/rsync` (Homebrew on Apple Silicon)
+2. `/usr/local/bin/rsync` (Homebrew on Intel)
+3. whatever `rsync` is on your `PATH`
+
+So once Homebrew's rsync is installed, freesync uses it automatically — you
+don't need to change your `PATH` or edit anything. **Each computer needs its
+own `brew install rsync`**; a machine that has never had it will fall through to
+openrsync at step 3.
+
+Why 3.1.0 specifically: `--info=progress2` (the single overall progress bar)
+landed in rsync 3.1.0, and `--no-human-readable` in 3.0.0. Anything newer is
+fine; Homebrew currently ships 3.5.x.
 
 ## Troubleshooting
 
@@ -204,6 +241,12 @@ all look identical on screen:
 
 Profiles are per-machine. Copying `profiles.tsv` between computers is what
 produces most of the above — `freesync add` on each machine is safer.
+
+**`rsync: unrecognized option '--info=progress2'` (or `--no-human-readable`)**
+
+That machine is falling back to macOS's built-in openrsync. Run
+`brew install rsync` on it, then `freesync doctor` to confirm the binary in use
+changed. See [Requirements](#requirements).
 
 ## License
 
